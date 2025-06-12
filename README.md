@@ -1,5 +1,6 @@
 ## Configuration
 
+```
 {
   "mcpServers": {
     "bnb-staking-workflow": {
@@ -14,3 +15,4 @@
     }
   }
 }
+```
