@@ -53,6 +53,11 @@ const DEFI_POOL_IDS = {
     id: "406b11b4-c4f9-4253-bfd3-388c208a4ecd",
     protocol: "Venus",
     type: "Lending"
+  },
+  WBNB: {
+    id: "747b58ab-aefd-42e1-a312-01ad5a0ab7f5",
+    protocol: "Venus",
+    type: "Lending"
   }
 };
 
@@ -75,6 +80,12 @@ const LIQUID_STAKED_MARKETS = {
     symbol: "slisBNB",
     decimals: 18
   },
+  WBNB: {
+    underlying: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+    vToken: "0xe10E80B7FD3a29fE46E16C30CC8F4dd938B742e2",
+    symbol: "WBNB",
+    decimals: 18
+  }
 };
 
 const VENUS_MARKETS = {
