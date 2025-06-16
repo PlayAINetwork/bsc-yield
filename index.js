@@ -58,6 +58,11 @@ const DEFI_POOL_IDS = {
     id: "747b58ab-aefd-42e1-a312-01ad5a0ab7f5",
     protocol: "Venus",
     type: "Lending"
+  },
+  SolvBTC: {
+    id: "870e5485-c1f2-4a14-b014-286d0a833bf6",
+    protocol: "Venus",
+    type: "Lending"
   }
 };
 
@@ -129,6 +134,12 @@ const VENUS_MARKETS = {
     underlying: "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d",
     vToken: "0x0C1DA220D301155b87318B90692Da8dc43B67340",
     symbol: "USD1",
+    decimals: 18
+  },
+  SolvBTC: {
+    underlying: "0x4aae823a6a0b376De6A78e74eCC5b079d38cBCf7",
+    vToken: "0xf841cb62c19fCd4fF5CD0AaB5939f3140BaaC3Ea",
+    symbol: "SolvBTC",
     decimals: 18
   },
 };
