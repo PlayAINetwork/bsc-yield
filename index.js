@@ -5,6 +5,69 @@ const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio
 const { z } = require("zod");
 const { ethers } = require("ethers");
 const https = require('https');
+const axios = require("axios");
+
+const LIFI_API_KEY = process.env.LIFI_API_KEY;
+
+const LIFI_CHAIN_MAP = {
+  'ETH': 1, 'ETHEREUM': 1,
+  'POL': 137, 'POLYGON': 137, 'MATIC': 137,
+  'ARB': 42161, 'ARBITRUM': 42161,
+  'OPT': 10, 'OPTIMISM': 10,
+  'BSC': 56, 'BNB': 56,
+  'AVAX': 43114, 'AVALANCHE': 43114,
+  'BASE': 8453,
+  'DAI': 100, 'GNOSIS': 100, 'XDAI': 100
+};
+
+const LIFI_RPC_URLS = {
+  1: "https://eth.llamarpc.com",
+  137: "https://polygon-rpc.com",
+  42161: "https://arbitrum.llamarpc.com",
+  10: "https://optimism.llamarpc.com",
+  56: "https://bsc.llamarpc.com",
+  43114: "https://avalanche.llamarpc.com",
+  8453: "https://base.llamarpc.com",
+  100: "https://rpc.gnosischain.com"
+};
+
+const LIFI_TOKEN_DECIMALS = {
+  '0xdac17f958d2ee523a2206206994597c13d831ec7': 6, 
+  '0x2791bca1f2de4661ed88a30c99a7a9449aa84174': 6,
+  '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9': 6, 
+  '0x94b008aa00579c1307b0ef2c499ad98a8ce58e58': 6,
+  '0x55d398326f99059ff775485246999027b3197955': 6, 
+  '0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7': 6,
+  
+  '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 6, 
+  '0x2791bca1f2de4661ed88a30c99a7a9449aa84174': 6, 
+  '0xaf88d065e77c8cc2239327c5edb3a432268e5831': 6,
+  '0x0b2c639c533813f4aa9d7837caf62653d097ff85': 6,
+  '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 6, 
+  '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': 6,
+  '0x0000000000000000000000000000000000000000': 18
+};
+
+
+function getLifiHeaders() {
+  return LIFI_API_KEY ? { 'x-lifi-api-key': LIFI_API_KEY } : {};
+}
+
+function getLifiChainId(chain) {
+  if (!isNaN(chain)) return parseInt(chain);
+  return LIFI_CHAIN_MAP[chain.toUpperCase()] || null;
+}
+
+function getLifiTokenDecimals(tokenAddress, chainId) {
+  const lowerCaseAddress = tokenAddress.toLowerCase();
+  return LIFI_TOKEN_DECIMALS[lowerCaseAddress] || 18;
+}
+
+function convertAmountToSmallestUnit(amount, decimals) {
+  const amountBN = ethers.parseUnits(amount.toString(), decimals);
+  return amountBN.toString();
+}
+
 
 const CHAIN_CONFIG = {
   chainId: 56,
@@ -301,11 +364,15 @@ const server = new McpServer({
   description: "MCP server for BNB staking and Venus Protocol lending/borrowing"
 });
 
-function getProvider() {
+function getProvider(chainId = 56) {
   try {
-    return new ethers.JsonRpcProvider(CHAIN_CONFIG.rpcUrl);
+    const rpcUrl = chainId === 56 ? CHAIN_CONFIG.rpcUrl : LIFI_RPC_URLS[chainId];
+    if (!rpcUrl) {
+      throw new Error(`No RPC URL configured for chain ID: ${chainId}`);
+    }
+    return new ethers.JsonRpcProvider(rpcUrl);
   } catch (error) {
-    throw new Error(`Failed to connect to BSC: ${error.message}`);
+    throw new Error(`Failed to connect to chain ${chainId}: ${error.message}`);
   }
 }
 
@@ -317,12 +384,12 @@ function isValidAddress(address) {
   return ethers.isAddress(address);
 }
 
-function getWallet() {
+function getWallet(chainId = 56) {
   if (!WALLET_PRIVATE_KEY) {
     throw new Error("WALLET_PRIVATE_KEY not set in environment");
   }
 
-  const provider = getProvider();
+  const provider = getProvider(chainId);
   const wallet = new ethers.Wallet(WALLET_PRIVATE_KEY, provider);
 
   if (WALLET_ADDRESS && wallet.address.toLowerCase() !== WALLET_ADDRESS.toLowerCase()) {
@@ -366,6 +433,537 @@ async function getLiquidStakedVTokens() {
     console.error("Failed to fetch liquid staked vTokens:", error);
   }
 }
+
+server.tool(
+  "lifiGetQuote",
+  "Get a quote for swapping tokens across chains using LI.FI protocol without executing the transaction",
+  {
+    fromChain: z.string().describe("Source chain (e.g., 'ETH', 'BSC', 'POL', 'ARB' or chain ID)"),
+    toChain: z.string().describe("Destination chain (e.g., 'ETH', 'BSC', 'POL', 'ARB' or chain ID)"),
+    fromToken: z.string().describe("Source token address (use '0x0000000000000000000000000000000000000000' for native)"),
+    toToken: z.string().describe("Destination token address (use '0x0000000000000000000000000000000000000000' for native)"),
+    fromAmount: z.string().describe("Amount in human-readable format (e.g., '0.1' for 0.1 ETH)"),
+    toAddress: z.string().optional().describe("Destination wallet address (defaults to sender address)"),
+    slippage: z.number().optional().default(0.5).describe("Slippage tolerance in percentage")
+  },
+  async ({ fromChain, toChain, fromToken, toToken, fromAmount, toAddress, slippage }) => {
+    try {
+      if (!WALLET_PRIVATE_KEY) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              status: "error",
+              message: "WALLET_PRIVATE_KEY not found in environment variables",
+              instruction: "Please add WALLET_PRIVATE_KEY to your MCP configuration"
+            }, null, 2)
+          }]
+        };
+      }
+
+      const fromChainId = getLifiChainId(fromChain);
+      const toChainId = getLifiChainId(toChain);
+
+      if (!fromChainId || !toChainId) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              status: "error",
+              message: `Invalid chain: ${!fromChainId ? fromChain : toChain}`,
+              supportedChains: Object.keys(LIFI_CHAIN_MAP)
+            }, null, 2)
+          }]
+        };
+      }
+
+      // Get wallet address for quote
+      const wallet = getWallet(fromChainId);
+      const fromAddress = wallet.address;
+
+      // Get token decimals and convert amount
+      const fromTokenDecimals = getLifiTokenDecimals(fromToken, fromChainId);
+      let fromAmountWei = convertAmountToSmallestUnit(fromAmount, fromTokenDecimals);
+
+      // For ERC20 tokens, try to get actual decimals
+      if (fromToken !== '0x0000000000000000000000000000000000000000') {
+        try {
+          const tokenContract = new ethers.Contract(fromToken, [
+            "function decimals() view returns (uint8)",
+            "function symbol() view returns (string)",
+            "function name() view returns (string)"
+          ], wallet.provider);
+
+          const [actualDecimals, symbol, name] = await Promise.all([
+            tokenContract.decimals(),
+            tokenContract.symbol(),
+            tokenContract.name()
+          ]);
+
+          // Recalculate with actual decimals
+          fromAmountWei = convertAmountToSmallestUnit(fromAmount, actualDecimals);
+          
+          console.log(`Token ${symbol} (${name}): Using ${actualDecimals} decimals`);
+        } catch (tokenError) {
+          console.log(`Could not fetch token details, using default decimals: ${fromTokenDecimals}`);
+        }
+      }
+
+      console.log(`Converting ${fromAmount} with ${fromTokenDecimals} decimals = ${fromAmountWei} smallest units`);
+
+      // Get quote from LI.FI
+      const quoteResponse = await axios.get(`https://li.quest/v1/quote`, {
+        params: {
+          fromChain: fromChainId,
+          toChain: toChainId,
+          fromToken,
+          toToken,
+          fromAmount: fromAmountWei,
+          fromAddress,
+          toAddress: toAddress || fromAddress,
+          slippage: slippage / 100
+        },
+        headers: getLifiHeaders(),
+        timeout: 30000
+      });
+
+      const quote = quoteResponse.data;
+
+      if (!quote) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              status: "error",
+              message: "No quote received from LI.FI"
+            }, null, 2)
+          }]
+        };
+      }
+
+      // Calculate price impact and exchange rate
+      const fromAmountFormatted = parseFloat(fromAmount);
+      const toAmountFormatted = quote.estimate?.toAmount ? 
+        parseFloat(ethers.formatUnits(quote.estimate.toAmount, getLifiTokenDecimals(toToken, toChainId))) : 0;
+      
+      const exchangeRate = fromAmountFormatted > 0 ? (toAmountFormatted / fromAmountFormatted) : 0;
+
+      // Format the response
+      const formattedQuote = {
+        status: "success",
+        id: quote.id,
+        type: quote.type,
+        tool: quote.tool,
+        quote: {
+          fromChain: {
+            id: fromChainId,
+            name: fromChain
+          },
+          toChain: {
+            id: toChainId, 
+            name: toChain
+          },
+          fromToken: {
+            address: fromToken,
+            symbol: quote.action?.fromToken?.symbol || "Unknown",
+            name: quote.action?.fromToken?.name || "Unknown Token",
+            decimals: quote.action?.fromToken?.decimals || fromTokenDecimals,
+            amount: fromAmount,
+            amountWei: fromAmountWei
+          },
+          toToken: {
+            address: toToken,
+            symbol: quote.action?.toToken?.symbol || "Unknown",
+            name: quote.action?.toToken?.name || "Unknown Token", 
+            decimals: quote.action?.toToken?.decimals || getLifiTokenDecimals(toToken, toChainId),
+            estimatedAmount: toAmountFormatted.toString(),
+            minimumAmount: quote.estimate?.toAmountMin ? 
+              ethers.formatUnits(quote.estimate.toAmountMin, getLifiTokenDecimals(toToken, toChainId)) : "0"
+          },
+          exchangeRate: exchangeRate.toFixed(6),
+          slippage: `${slippage}%`,
+          addresses: {
+            fromAddress: fromAddress,
+            toAddress: toAddress || fromAddress,
+            approvalAddress: quote.estimate?.approvalAddress
+          }
+        },
+        estimate: {
+          fromAmount: quote.estimate?.fromAmount,
+          toAmount: quote.estimate?.toAmount,
+          toAmountMin: quote.estimate?.toAmountMin,
+          approvalAddress: quote.estimate?.approvalAddress,
+          executionDuration: quote.estimate?.executionDuration || "Unknown",
+          gasCosts: quote.estimate?.gasCosts || [],
+          feeCosts: quote.estimate?.feeCosts || []
+        },
+        route: {
+          steps: quote.includedSteps?.length || 0,
+          bridgeUsed: quote.tool,
+          protocols: quote.includedSteps?.map(step => step.tool) || []
+        },
+        costs: {
+          totalGasEstimate: quote.estimate?.gasCosts?.reduce((total, gas) => {
+            return total + parseFloat(gas.estimate || 0);
+          }, 0) || 0,
+          totalFees: quote.estimate?.feeCosts?.reduce((total, fee) => {
+            return total + parseFloat(fee.amount || 0);
+          }, 0) || 0
+        },
+        warnings: [],
+        ready: !!quote.transactionRequest,
+        timestamp: new Date().toISOString()
+      };
+
+      // Add warnings for common issues
+      if (fromChainId === toChainId) {
+        formattedQuote.warnings.push("Same chain swap - may have limited routing options");
+      }
+
+      if (parseFloat(fromAmount) < 1) {
+        formattedQuote.warnings.push("Small amount - may result in high slippage or failed transactions");
+      }
+
+      if (!quote.estimate?.approvalAddress && fromToken !== '0x0000000000000000000000000000000000000000') {
+        formattedQuote.warnings.push("No approval address found - token approval may be required");
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify(formattedQuote, null, 2)
+        }]
+      };
+
+    } catch (error) {
+      // Enhanced error handling
+      let errorMessage = error.message;
+      let errorDetails = null;
+
+      if (error.response) {
+        errorMessage = `LI.FI API Error: ${error.response.status}`;
+        errorDetails = error.response.data;
+      } else if (error.code === 'ECONNABORTED') {
+        errorMessage = "Request timeout - LI.FI API took too long to respond";
+      } else if (error.code === 'NETWORK_ERROR') {
+        errorMessage = "Network error - check your internet connection";
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            status: "error",
+            message: errorMessage,
+            code: error.code,
+            details: errorDetails,
+            suggestion: "Try with different tokens or amounts, or check if the route is supported"
+          }, null, 2)
+        }]
+      };
+    }
+  }
+);
+
+server.tool(
+  "lifiExecuteSwap",
+  "Execute a complete cross-chain token swap using LI.FI protocol",
+  {
+    fromChain: z.string().describe("Source chain (e.g., 'ETH', 'BSC', 'ARB' or chain ID)"),
+    toChain: z.string().describe("Destination chain (e.g., 'ETH', 'BSC', 'ARB' or chain ID)"),
+    fromToken: z.string().describe("Source token address (use '0x0000000000000000000000000000000000000000' for native token)"),
+    toToken: z.string().describe("Destination token address (use '0x0000000000000000000000000000000000000000' for native token)"),
+    fromAmount: z.string().describe("Amount to swap in human-readable format (e.g., '0.1' for 0.1 ETH, '100' for 100 USDC)"),
+    toAddress: z.string().optional().describe("Destination wallet address (defaults to sender address)"),
+    slippage: z.number().optional().default(0.5).describe("Slippage tolerance in percentage")
+  },
+  async ({ fromChain, toChain, fromToken, toToken, fromAmount, toAddress, slippage }) => {
+    try {
+      if (!WALLET_PRIVATE_KEY) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              status: "error",
+              message: "WALLET_PRIVATE_KEY not found in environment variables"
+            }, null, 2)
+          }]
+        };
+      }
+
+      const fromChainId = getLifiChainId(fromChain);
+      const toChainId = getLifiChainId(toChain);
+
+      if (!fromChainId || !toChainId) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              status: "error",
+              message: `Invalid chain: ${!fromChainId ? fromChain : toChain}`
+            }, null, 2)
+          }]
+        };
+      }
+
+      const wallet = getWallet(fromChainId);
+      const fromAddress = wallet.address;
+
+      let fromTokenDecimals = getLifiTokenDecimals(fromToken, fromChainId);
+      let fromAmountWei;
+
+      if (fromToken === '0x0000000000000000000000000000000000000000') {
+        fromAmountWei = convertAmountToSmallestUnit(fromAmount, 18);
+        
+        const balance = await wallet.provider.getBalance(wallet.address);
+        const gasReserve = ethers.parseEther("0.01");
+        if (balance < BigInt(fromAmountWei) + gasReserve) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "error",
+                message: "Insufficient balance (need to reserve gas)",
+                required: formatBalance((BigInt(fromAmountWei) + gasReserve).toString(), 18),
+                available: formatBalance(balance, 18),
+                gasReserve: formatBalance(gasReserve, 18)
+              }, null, 2)
+            }]
+          };
+        }
+      } else {
+        const tokenContract = new ethers.Contract(fromToken, [
+          "function balanceOf(address) view returns (uint256)",
+          "function decimals() view returns (uint8)",
+          "function symbol() view returns (string)",
+          "function allowance(address owner, address spender) view returns (uint256)"
+        ], wallet);
+        
+        try {
+          const [tokenBalance, actualDecimals, symbol] = await Promise.all([
+            tokenContract.balanceOf(wallet.address),
+            tokenContract.decimals(),
+            tokenContract.symbol()
+          ]);
+          
+          fromTokenDecimals = actualDecimals;
+          fromAmountWei = convertAmountToSmallestUnit(fromAmount, actualDecimals);
+          
+          console.log(`Token ${symbol}: ${actualDecimals} decimals, converting ${fromAmount} = ${fromAmountWei} wei`);
+          
+          if (tokenBalance < BigInt(fromAmountWei)) {
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  status: "error",
+                  message: "Insufficient token balance",
+                  token: symbol,
+                  required: formatBalance(fromAmountWei, actualDecimals),
+                  available: formatBalance(tokenBalance, actualDecimals)
+                }, null, 2)
+              }]
+            };
+          }
+          
+        } catch (tokenError) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "error",
+                message: "Failed to check token details",
+                details: tokenError.message
+              }, null, 2)
+            }]
+          };
+        }
+      }
+
+      let quote;
+      try {
+        const quoteResponse = await axios.get(`https://li.quest/v1/quote`, {
+          params: {
+            fromChain: fromChainId,
+            toChain: toChainId,
+            fromToken,
+            toToken,
+            fromAmount: fromAmountWei,
+            fromAddress,
+            toAddress: toAddress || fromAddress,
+            slippage: slippage / 100
+          },
+          headers: getLifiHeaders(),
+          timeout: 30000
+        });
+
+        quote = quoteResponse.data;
+        
+        if (!quote || !quote.transactionRequest) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "error",
+                message: "Invalid quote received from LI.FI",
+                quote: quote
+              }, null, 2)
+            }]
+          };
+        }
+        
+      } catch (quoteError) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              status: "error",
+              message: "Failed to get quote from LI.FI",
+              details: quoteError.response?.data || quoteError.message
+            }, null, 2)
+          }]
+        };
+      }
+
+      if (fromToken !== '0x0000000000000000000000000000000000000000' && quote.estimate?.approvalAddress) {
+        try {
+          const tokenContract = new ethers.Contract(fromToken, [
+            "function allowance(address owner, address spender) view returns (uint256)",
+            "function approve(address spender, uint256 amount) returns (bool)"
+          ], wallet);
+          
+          const currentAllowance = await tokenContract.allowance(wallet.address, quote.estimate.approvalAddress);
+          
+          if (currentAllowance < BigInt(fromAmountWei)) {
+            console.log("Approving token spend...");
+            const approveTx = await tokenContract.approve(quote.estimate.approvalAddress, fromAmountWei);
+            await approveTx.wait();
+            console.log("Token approval confirmed");
+          }
+        } catch (approvalError) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "error",
+                message: "Token approval failed",
+                details: approvalError.message
+              }, null, 2)
+            }]
+          };
+        }
+      }
+
+      try {
+        console.log("Executing swap transaction...");
+        
+        const txRequest = {
+          ...quote.transactionRequest,
+          gasLimit: quote.transactionRequest.gasLimit || ethers.parseUnits("500000", "wei")
+        };
+        
+        const tx = await wallet.sendTransaction(txRequest);
+        const receipt = await tx.wait();
+
+        if (receipt.status === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "error",
+                message: "Transaction failed on blockchain",
+                txHash: tx.hash,
+                receipt: receipt
+              }, null, 2)
+            }]
+          };
+        }
+
+        let finalStatus = null;
+        if (fromChainId !== toChainId) {
+          await new Promise(resolve => setTimeout(resolve, 5000));
+
+          try {
+            const statusResponse = await axios.get(`https://li.quest/v1/status`, {
+              params: {
+                txHash: tx.hash,
+                bridge: quote.tool,
+                fromChain: fromChainId,
+                toChain: toChainId
+              },
+              headers: getLifiHeaders()
+            });
+            finalStatus = statusResponse.data;
+          } catch (error) {
+            console.error("Error checking status:", error.message);
+          }
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              status: "success",
+              swap: {
+                fromChain: fromChain,
+                toChain: toChain,
+                fromAddress,
+                toAddress: toAddress || fromAddress,
+                fromToken,
+                toToken,
+                fromAmount: quote.estimate?.fromAmount,
+                toAmount: quote.estimate?.toAmount,
+                toAmountMin: quote.estimate?.toAmountMin,
+                tool: quote.tool,
+                type: quote.type
+              },
+              transaction: {
+                hash: tx.hash,
+                from: tx.from,
+                to: tx.to,
+                value: tx.value.toString(),
+                gasPrice: tx.gasPrice?.toString(),
+                gasLimit: tx.gasLimit?.toString(),
+                blockNumber: receipt.blockNumber,
+                gasUsed: receipt.gasUsed.toString(),
+                status: receipt.status
+              },
+              bridgeStatus: finalStatus,
+              timestamp: new Date().toISOString()
+            }, null, 2)
+          }]
+        };
+        
+      } catch (executionError) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              status: "error",
+              message: "Transaction execution failed",
+              details: executionError.message,
+              code: executionError.code,
+              transactionData: quote.transactionRequest
+            }, null, 2)
+          }]
+        };
+      }
+
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            status: "error",
+            message: error.message,
+            code: error.code,
+            reason: error.reason
+          }, null, 2)
+        }]
+      };
+    }
+  }
+);
 
 //getAPY
 server.tool(
