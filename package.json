@@ -1,6 +1,6 @@
 {
   "name": "bsc-yield",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Model Context Protocol server for blockchain staking , lending on BSC.",
   "main": "index.js",
   "keywords": [
