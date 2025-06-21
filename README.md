@@ -35,12 +35,13 @@ Add to your MCP client configuration (e.g., Claude Desktop):
 ```json
 {
   "mcpServers": {
-    "staking": {
-      "command": "npx",
-      "args": ["bsc-yield"],
+    "bsc-defi": {
+      "command": "node",
+      "args": ["G:/beramcp/staking-mcp/index.js"],
       "env": {
-        "WALLET_PRIVATE_KEY": "your_private_key_here", 
-        "WALLET_ADDRESS": "your_wallet_address_here"
+        "WALLET_PRIVATE_KEY": "",
+        "WALLET_ADDRESS": "",
+        "LIFI_API_KEY": ""
       }
     }
   }
